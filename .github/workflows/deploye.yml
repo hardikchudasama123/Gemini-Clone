@@ -1,0 +1,125 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Lets you redeploy the current main from the Actions tab without a new commit.
+  workflow_dispatch:
+
+# One deploy at a time. Two overlapping runs would race on `git reset` and
+# `docker compose` in the same directory; the newer commit is the one that
+# matters, so let it cancel a deploy still in flight.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Catches syntax errors and broken imports before anything touches the server.
+  # `npm run check` is deliberately not used here: it exits non-zero without
+  # provider API keys, which CI has no business holding.
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            server/package-lock.json
+
+      - name: Install and build web
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      # The server is not bundled, so the equivalent check is that it actually
+      # boots and serves. Importing it would never return — index.js starts
+      # listening at import time — so it runs as a real process and is killed
+      # once /api/health answers. No API keys needed: missing providers are a
+      # warning at boot, not a failure.
+      - name: Boot server and check health
+        working-directory: server
+        env:
+          PORT: 8787
+        run: |
+          npm ci
+          node index.js & SRV=$!
+          trap 'kill $SRV 2>/dev/null || true' EXIT
+          curl -fsS --retry 20 --retry-delay 1 --retry-all-errors \
+            http://localhost:8787/api/health
+
+  deploy:
+    needs: build
+    # Never deploy a pull request — only main, and only after the build passes.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: Deploy to EC2
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          SSH_HOST: ${{ secrets.EC2_HOST }}
+          SSH_USER: ${{ secrets.EC2_USER }}
+          SSH_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+          APP_DIR: ${{ secrets.EC2_APP_DIR || 'Gemini-Clone' }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+
+          # Prefer a pinned host key. Falling back to ssh-keyscan trusts
+          # whatever answers on this run, which cannot detect a swapped host —
+          # set EC2_KNOWN_HOSTS to close that gap.
+          if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            echo "::warning::EC2_KNOWN_HOSTS is not set; trusting the host key from this run."
+            ssh-keyscan -T 15 "$SSH_HOST" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/id_deploy -o IdentitiesOnly=yes -o ConnectTimeout=15 \
+            "$SSH_USER@$SSH_HOST" "APP_DIR='$APP_DIR' SHA='${{ github.sha }}' bash -euo pipefail" <<'REMOTE'
+            cd "$HOME/$APP_DIR"
+
+            # Deploy exactly what is on main. `git pull` would fail on a merge
+            # conflict or a stray local edit and leave the tree half-updated;
+            # this cannot. Untracked and ignored files are left alone, so the
+            # server's .env survives — it is in .gitignore.
+            git fetch --prune origin
+            git reset --hard "$SHA"
+
+            # Build while the old containers keep serving, then swap. Running
+            # `down` first would take the app offline for the whole build.
+            docker compose build
+            docker compose up -d --remove-orphans
+
+            # Reclaim the layers the rebuild just orphaned. Small EBS volumes
+            # fill up within a few dozen deploys otherwise.
+            docker image prune -f
+
+            # The API is not published to the host, so this goes through the
+            # web container's /api proxy — the same path a browser takes.
+            echo "Waiting for /api/health ..."
+            curl -fsS --retry 20 --retry-delay 3 --retry-all-errors \
+              http://localhost:8787/api/health > /dev/null
+            echo "Healthy. Deployed $SHA"
+          REMOTE
+
+      - name: Report failure
+        if: failure()
+        run: |
+          echo "::error::Deploy failed. The previous containers may still be running —"
+          echo "::error::check with: docker compose ps && docker compose logs --tail=50"
+
+        

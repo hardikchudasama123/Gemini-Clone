@@ -1,0 +1,40 @@
+services:
+  # Express API. Holds the provider keys and is not published to the host — the
+  # only way in is through the web container's /api proxy.
+  api:
+    build: ./server
+    image: gemini-clone-api
+    container_name: gemini-clone-api
+    expose:
+      - '8787'
+    environment:
+      # No single key is mandatory here — any provider present contributes its
+      # models, and the server logs what is missing at boot. Hard-requiring one
+      # would refuse to start a setup that is otherwise perfectly usable.
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      # Text-to-image. Without it nothing can generate images: Gemini's image
+      # models are free-tier quota 0.
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      # Optional — pdf/audio/video input, and the Nano Banana models if billed.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # Sign-in is disabled and a setup screen is shown if these are absent.
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      PORT: 8787
+    restart: unless-stopped
+
+  # nginx serving the built React bundle, proxying /api to the api service.
+  # Published on 8787 so the app keeps the same URL it had as one container,
+  # which means the Supabase redirect URLs need no change.
+  web:
+    build: ./web
+    image: gemini-clone-web
+    container_name: gemini-clone-web
+    ports:
+      - '8787:80'
+    depends_on:
+      api:
+        # Wait for /api/health, so nginx never starts before its upstream.
+        condition: service_healthy
+    restart: unless-stopped
